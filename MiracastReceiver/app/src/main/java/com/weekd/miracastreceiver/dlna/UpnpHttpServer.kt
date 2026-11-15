@@ -8,9 +8,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import timber.log.Timber
-import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.io.OutputStream
+import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 
@@ -31,6 +30,7 @@ class UpnpHttpServer(
     private var serverSocket: ServerSocket? = null
     private var serverJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
+    private val events = UpnpEventSubscriptions(renderer::getState)
 
     fun start() {
         if (serverJob?.isActive == true) {
@@ -38,6 +38,7 @@ class UpnpHttpServer(
             return
         }
 
+        renderer.onStateChanged = events::publish
         serverJob = scope.launch {
             try {
                 serverSocket = ServerSocket(port)
@@ -58,6 +59,8 @@ class UpnpHttpServer(
     }
 
     fun stop() {
+        renderer.onStateChanged = null
+        events.close()
         try {
             serverJob?.cancel()
             serverSocket?.close()
@@ -70,56 +73,26 @@ class UpnpHttpServer(
     private fun handleClient(socket: Socket) {
         socket.use { client ->
             try {
-                val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                client.soTimeout = 10_000
                 val output = client.getOutputStream()
+                val request = DlnaHttpRequest.read(client.getInputStream()) ?: return
+                val headers = request.headers
+                val body = request.body
+                val method = request.method
+                val path = request.path
 
-                val requestLine = reader.readLine() ?: return
-                val headers = mutableMapOf<String, String>()
-                var contentLength = 0
+                Timber.d("UPnP $method $path")
 
-                var line: String?
-                while (true) {
-                    line = reader.readLine()
-                    if (line.isNullOrEmpty()) break
-                    val index = line.indexOf(':')
-                    if (index > 0) {
-                        val key = line.substring(0, index).trim()
-                        val value = line.substring(index + 1).trim()
-                        headers[key] = value
-
-                        if (key.equals("Content-Length", ignoreCase = true)) {
-                            contentLength = value.toIntOrNull() ?: 0
-                        }
-                    }
-                }
-
-                // 读取 body
-                val body = if (contentLength > 0) {
-                    val buffer = CharArray(contentLength)
-                    reader.read(buffer, 0, contentLength)
-                    String(buffer)
-                } else {
-                    ""
-                }
-
-                val parts = requestLine.split(" ")
-                if (parts.size >= 2) {
-                    val method = parts[0]
-                    val path = parts[1]
-
-                    Timber.d("UPnP $method $path")
-
-                    when {
-                        path == "/device.xml" -> sendDeviceDescription(output)
-                        path == "/service/ConnectionManager.xml" -> sendConnectionManagerScpd(output)
-                        path == "/service/AVTransport.xml" -> sendAvTransportScpd(output)
-                        path == "/service/RenderingControl.xml" -> sendRenderingControlScpd(output)
-                        path == "/control/AVTransport" -> handleAvTransportControl(output, body, headers)
-                        path == "/control/RenderingControl" -> handleRenderingControl(output, body, headers)
-                        path == "/control/ConnectionManager" -> handleConnectionManager(output, body, headers)
-                        path.startsWith("/event/") -> handleEvent(output)
-                        else -> sendNotFound(output)
-                    }
+                when {
+                    path == "/device.xml" -> sendDeviceDescription(output)
+                    path == "/service/ConnectionManager.xml" -> sendConnectionManagerScpd(output)
+                    path == "/service/AVTransport.xml" -> sendAvTransportScpd(output)
+                    path == "/service/RenderingControl.xml" -> sendRenderingControlScpd(output)
+                    path == "/control/AVTransport" -> handleAvTransportControl(output, body, headers)
+                    path == "/control/RenderingControl" -> handleRenderingControl(output, body, headers)
+                    path == "/control/ConnectionManager" -> handleConnectionManager(output, body, headers)
+                    path.startsWith("/event/") -> handleEvent(output, method, path, headers, client.inetAddress)
+                    else -> sendNotFound(output)
                 }
             } catch (e: Exception) {
                 Timber.e(e, "Error handling UPnP client")
@@ -152,7 +125,7 @@ class UpnpHttpServer(
     }
 
     private fun handleAvTransportControl(output: OutputStream, body: String, headers: Map<String, String>) {
-        val action = SoapParser.extractAction(headers["SOAPACTION"] ?: headers["SOAPAction"])
+        val action = SoapParser.extractAction(headers["soapaction"])
         Timber.i("AVTransport action: $action")
 
         // 调试：打印完整请求体，帮助排查 Emby 的格式
@@ -189,9 +162,12 @@ class UpnpHttpServer(
             }
             "SetNextAVTransportURI" -> {
                 val uri = SoapParser.extractTagValue(body, "NextURI")
-                if (uri.isNotBlank()) renderer.setQualityUri(uri)
+                val metadata = SoapParser.extractTagValue(body, "NextURIMetaData")
+                renderer.setNextAVTransportURI(uri, metadata)
                 buildSoapResponse(action, "")
             }
+            "Next" -> if (renderer.next()) buildSoapResponse(action, "")
+                else buildSoapFault("701", "Transition not available")
             "Play" -> {
                 val speed = extractSpeed(body)
                 if (speed.isNotBlank()) {
@@ -235,7 +211,7 @@ class UpnpHttpServer(
             "GetPositionInfo" -> {
                 val state = renderer.getState()
                 val content = """
-                    <Track>1</Track>
+                    <Track>${if (state.uri.isBlank()) 0 else state.currentIndex + 1}</Track>
                     <TrackDuration>${SoapParser.formatTime(state.duration)}</TrackDuration>
                     <TrackMetaData>${SoapParser.escapeXml(state.metadata)}</TrackMetaData>
                     <TrackURI>${SoapParser.escapeXml(state.uri)}</TrackURI>
@@ -249,12 +225,12 @@ class UpnpHttpServer(
             "GetMediaInfo" -> {
                 val state = renderer.getState()
                 val content = """
-                    <NrTracks>1</NrTracks>
+                    <NrTracks>${state.playlist.size}</NrTracks>
                     <MediaDuration>${SoapParser.formatTime(state.duration)}</MediaDuration>
                     <CurrentURI>${SoapParser.escapeXml(state.uri)}</CurrentURI>
                     <CurrentURIMetaData>${SoapParser.escapeXml(state.metadata)}</CurrentURIMetaData>
-                    <NextURI></NextURI>
-                    <NextURIMetaData></NextURIMetaData>
+                    <NextURI>${SoapParser.escapeXml(state.nextUri)}</NextURI>
+                    <NextURIMetaData>${SoapParser.escapeXml(state.nextMetadata)}</NextURIMetaData>
                     <PlayMedium>NETWORK</PlayMedium>
                     <RecordMedium>NOT_IMPLEMENTED</RecordMedium>
                     <WriteStatus>NOT_IMPLEMENTED</WriteStatus>
@@ -262,7 +238,8 @@ class UpnpHttpServer(
                 buildSoapResponse(action, content)
             }
             "GetCurrentTransportActions" -> {
-                val content = "<Actions>Play,Pause,Stop,Seek</Actions>"
+                val next = if (renderer.getState().nextUri.isNotBlank()) ",Next" else ""
+                val content = "<Actions>Play,Pause,Stop,Seek$next</Actions>"
                 buildSoapResponse(action, content)
             }
             "GetTransportSettings" -> {
@@ -283,28 +260,29 @@ class UpnpHttpServer(
     }
 
     private fun handleRenderingControl(output: OutputStream, body: String, headers: Map<String, String>) {
-        val action = SoapParser.extractAction(headers["SOAPACTION"] ?: headers["SOAPAction"])
+        val action = SoapParser.extractAction(headers["soapaction"])
         Timber.i("RenderingControl action: $action")
+        fun respond(content: String) = buildSoapResponse(action, content, "RenderingControl")
 
         val response = when (action) {
             "GetVolume" -> {
                 val state = renderer.getState()
-                buildSoapResponse(action, "<CurrentVolume>${state.volume}</CurrentVolume>")
+                respond("<CurrentVolume>${state.volume}</CurrentVolume>")
             }
             "SetVolume" -> {
                 val volume = SoapParser.extractTagValue(body, "DesiredVolume").toIntOrNull() ?: 50
                 renderer.setVolume(volume)
-                buildSoapResponse(action, "")
+                respond("")
             }
             "GetMute" -> {
                 val state = renderer.getState()
                 val mute = if (state.muted) "1" else "0"
-                buildSoapResponse(action, "<CurrentMute>$mute</CurrentMute>")
+                respond("<CurrentMute>$mute</CurrentMute>")
             }
             "SetMute" -> {
                 val mute = SoapParser.extractTagValue(body, "DesiredMute") == "1"
                 renderer.setMute(mute)
-                buildSoapResponse(action, "")
+                respond("")
             }
             else -> buildSoapFault("401", "Invalid Action")
         }
@@ -313,8 +291,9 @@ class UpnpHttpServer(
     }
 
     private fun handleConnectionManager(output: OutputStream, body: String, headers: Map<String, String>) {
-        val action = SoapParser.extractAction(headers["SOAPACTION"] ?: headers["SOAPAction"])
+        val action = SoapParser.extractAction(headers["soapaction"])
         Timber.i("ConnectionManager action: $action")
+        fun respond(content: String) = buildSoapResponse(action, content, "ConnectionManager")
 
         val response = when (action) {
             "GetProtocolInfo" -> {
@@ -322,10 +301,10 @@ class UpnpHttpServer(
                     <Source></Source>
                     <Sink>http-get:*:video/*:*,http-get:*:audio/*:*,http-get:*:image/*:*</Sink>
                 """.trimIndent()
-                buildSoapResponse(action, content)
+                respond(content)
             }
             "GetCurrentConnectionIDs" -> {
-                buildSoapResponse(action, "<ConnectionIDs>0</ConnectionIDs>")
+                respond("<ConnectionIDs>0</ConnectionIDs>")
             }
             "GetCurrentConnectionInfo" -> {
                 val content = """
@@ -337,7 +316,7 @@ class UpnpHttpServer(
                     <Direction>Input</Direction>
                     <Status>OK</Status>
                 """.trimIndent()
-                buildSoapResponse(action, content)
+                respond(content)
             }
             else -> buildSoapFault("401", "Invalid Action")
         }
@@ -345,18 +324,46 @@ class UpnpHttpServer(
         sendSoapResponse(output, response)
     }
 
-    private fun handleEvent(output: OutputStream) {
-        // 简化实现：返回 200 OK
-        val response = "HTTP/1.1 200 OK\r\n\r\n"
-        output.write(response.toByteArray())
+    private fun handleEvent(
+        output: OutputStream, method: String, path: String,
+        headers: Map<String, String>, peer: InetAddress
+    ) {
+        val service = path.removePrefix("/event/")
+        if (service !in UpnpEventSubscriptions.SERVICES) { sendNotFound(output); return }
+        val sid = headers["sid"]
+        when (method) {
+            "SUBSCRIBE" -> {
+                val reply = if (sid != null) {
+                    if ("callback" in headers || "nt" in headers) null
+                    else events.renew(service, sid, headers["timeout"])
+                } else {
+                    if (!headers["nt"].equals("upnp:event", ignoreCase = true)) null
+                    else events.subscribe(service, headers["callback"].orEmpty(), headers["timeout"], peer)
+                }
+                if (reply == null) { eventResponse(output, "412 Precondition Failed"); return }
+                eventResponse(output, "200 OK", "SID: ${reply.sid}\r\nTIMEOUT: Second-${reply.timeoutSeconds}\r\n")
+                if (sid == null) events.initial(reply.sid)
+            }
+            "UNSUBSCRIBE" -> {
+                val removed = sid != null && "callback" !in headers && "nt" !in headers &&
+                    events.unsubscribe(service, sid)
+                eventResponse(output, if (removed) "200 OK" else "412 Precondition Failed")
+            }
+            else -> eventResponse(output, "405 Method Not Allowed")
+        }
+    }
+
+    private fun eventResponse(output: OutputStream, status: String, headers: String = "") {
+        output.write(("HTTP/1.1 $status\r\n${headers}Content-Length: 0\r\nConnection: close\r\n\r\n")
+            .toByteArray(Charsets.US_ASCII))
         output.flush()
     }
 
-    private fun buildSoapResponse(action: String, content: String): String {
+    private fun buildSoapResponse(action: String, content: String, service: String = "AVTransport"): String {
         return """<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
-    <u:${action}Response xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+    <u:${action}Response xmlns:u="urn:schemas-upnp-org:service:$service:1">
       $content
     </u:${action}Response>
   </s:Body>

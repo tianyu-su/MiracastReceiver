@@ -122,16 +122,20 @@ class CastReceiverService : Service() {
                 ACTION_UPDATE_POSITION -> {
                     val position = intent.getLongExtra("position", 0L)
                     val duration = intent.getLongExtra("duration", 0L)
-                    val isPlaying = intent.getBooleanExtra("is_playing", false)
-                    dlnaRenderer.updatePosition(position, duration)
-                    if (isPlaying) dlnaRenderer.setPlaying() else dlnaRenderer.setPaused()
+                    val status = when (intent.getIntExtra("playback_state", 1)) {
+                        androidx.media3.common.Player.STATE_ENDED -> DlnaMediaRenderer.PlaybackStatus.ENDED
+                        androidx.media3.common.Player.STATE_BUFFERING -> DlnaMediaRenderer.PlaybackStatus.BUFFERING
+                        androidx.media3.common.Player.STATE_READY -> if (intent.getBooleanExtra("is_playing", false))
+                            DlnaMediaRenderer.PlaybackStatus.PLAYING else DlnaMediaRenderer.PlaybackStatus.PAUSED
+                        else -> DlnaMediaRenderer.PlaybackStatus.IDLE
+                    }
+                    dlnaRenderer.updatePlayback(intent.getLongExtra("dlna_generation", -1L),
+                        position, duration, status, intent.getStringExtra("media_uri"))
                     Timber.d("Player position updated: $position / $duration")
                 }
                 ACTION_PLAYBACK_STOPPED -> {
-                    // TV 端本地退出/播放结束，需要让 DLNA 状态归零，
-                    // 否则 Emby 会一直显示"正在播放"且无法取消/切换投屏。
-                    dlnaRenderer.updatePosition(0L, 0L)
-                    dlnaRenderer.setStopped()
+                    // Preserve the stopped state without accepting stale updates from a replaced load.
+                    dlnaRenderer.playbackStopped(intent.getLongExtra("dlna_generation", -1L))
                     Timber.i("Playback stopped locally, DLNA renderer reset to STOPPED")
                 }
             }
@@ -322,6 +326,7 @@ class CastReceiverService : Service() {
             val state = dlnaRenderer.getState()
             // 启动 PlayerActivity 并播放
             val intent = Intent(this, com.weekd.miracastreceiver.ui.PlayerActivity::class.java).apply {
+                putExtra("dlna_generation", state.generation)
                 if (state.playlist.size > 1) {
                     putStringArrayListExtra(
                         com.weekd.miracastreceiver.ui.PlayerActivity.EXTRA_MEDIA_URIS,

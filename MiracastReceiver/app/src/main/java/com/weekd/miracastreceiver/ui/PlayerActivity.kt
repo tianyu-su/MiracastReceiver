@@ -140,6 +140,7 @@ class PlayerActivity : AppCompatActivity() {
     private var castToken: String? = null
     private var castIdleReason: String? = null
     private var castStoppedBySender = false
+    private var dlnaGeneration = -1L
     private var trackSelector: DefaultTrackSelector? = null
     private var mediaUri: String? = null
     private var mediaTitle: String? = null
@@ -369,8 +370,10 @@ class PlayerActivity : AppCompatActivity() {
                             Player.STATE_ENDED -> {
                                 Timber.d("Player state: ENDED")
                                 tvStatus.text = getString(R.string.status_finished)
+                                stopProgressUpdates()
                                 reportPlaybackPosition()
-                                playNextOrFinish()
+                                // ExoPlayer has already advanced through its video timeline.
+                                // The receiver now either consumes NextURI or reports STOPPED.
                             }
                         }
                     }
@@ -577,6 +580,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
+        stopProgressUpdates()
         com.weekd.miracastreceiver.castplus.CastPlusReceiver.current?.end()
         val nextCastToken = if (intent?.getStringExtra(EXTRA_SOURCE_TYPE) == "CAST")
             intent.getStringExtra(CastPlayerBridge.TOKEN) else null
@@ -590,6 +594,7 @@ class PlayerActivity : AppCompatActivity() {
             player?.clearMediaItems()
         }
         castToken = nextCastToken
+        dlnaGeneration = intent?.getLongExtra("dlna_generation", -1L) ?: -1L
         castIdleReason = null
         castStoppedBySender = false
         // 每次新的投屏请求都从 0° 开始
@@ -1490,6 +1495,7 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun reportPlaybackPosition() {
         if (castToken != null) { reportCastState(); return }
+        if (dlnaGeneration < 0L) return
         val currentPlayer = player ?: return
         val position = currentPlayer.currentPosition
         val duration = currentPlayer.duration.takeIf { it > 0 } ?: 0L
@@ -1499,6 +1505,9 @@ class PlayerActivity : AppCompatActivity() {
             putExtra("position", position)
             putExtra("duration", duration)
             putExtra("is_playing", currentPlayer.isPlaying)
+            putExtra("playback_state", currentPlayer.playbackState)
+            putExtra("dlna_generation", dlnaGeneration)
+            putExtra("media_uri", currentPlayer.currentMediaItem?.localConfiguration?.uri?.toString())
             setPackage(packageName)
         }
         sendBroadcast(intent)
@@ -1513,7 +1522,9 @@ class PlayerActivity : AppCompatActivity() {
             reportCastState("IDLE", castIdleReason ?: "CANCELLED", endSession = endCastSession)
             return
         }
+        if (dlnaGeneration < 0L) return
         val intent = Intent(ACTION_PLAYBACK_STOPPED).apply {
+            putExtra("dlna_generation", dlnaGeneration)
             setPackage(packageName)
         }
         sendBroadcast(intent)

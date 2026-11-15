@@ -1,0 +1,26 @@
+{
+  "base_tag": "v1.2.13",
+  "base_commit": "cfbd05579ad0f1520eeda0b40ec6fcbe664aaa1d",
+  "fixed_version": "1.2.13-autonext.1",
+  "min_sdk": 21,
+  "abi": "armeabi-v7a",
+  "tests": {
+    "tests": 111,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "new_dlna_tests": 14,
+  "device": "Konka-Projector-M62",
+  "device_prebuffered_next": "passed",
+  "device_sender_continues_after_notify": "passed",
+  "youku_actual_autonext": "passed (user confirmed, without manually selecting next episode)",
+  "youku_evidence": "User confirmation; no protocol trace of this specific transition captured.",
+  "original_application_id": "com.weekd.miracastreceiver",
+  "fixed_application_id": "com.weekd.miracastreceiver.autonext",
+  "sha256": {
+    "apks/original-v1.2.13/miracast-receiver-v1.2.13-armeabi-v7a.apk": "af2ead152f2366d817265e0ab7ec55ddcd1cd4a7358491d84c6674bb0fd6759d",
+    "apks/autonext-v1.2.13/miracast-receiver-v1.2.13-autonext.1-armeabi-v7a.apk": "3fff8794141aa85ee9f71bc14abac0f32dda5d8af8746ad9f50481c475a361c2"
+  },
+  "existing_test_flake": "One prior run of the unchanged NameSetupTest had Connection reset; full rerun passed."
+}

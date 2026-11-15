@@ -21,6 +21,7 @@ android {
         targetSdk = 36
         versionCode = 18
         versionName = "1.2.13"
+        manifestPlaceholders["appDisplayName"] = "@string/app_name"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -41,6 +42,14 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Optional side-by-side local build; upstream signing keys are unavailable.
+            if (project.hasProperty("autonextBuild")) {
+                applicationIdSuffix = ".autonext"
+                versionNameSuffix = "-autonext.1"
+                manifestPlaceholders["appDisplayName"] = "Miracast Receiver 连播测试版"
+            }
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(

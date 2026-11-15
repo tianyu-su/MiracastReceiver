@@ -26,10 +26,21 @@ class DlnaMediaRenderer {
         var duration: Long = 0L,
         var playlist: List<String> = emptyList(),
         var currentIndex: Int = 0,
-        var playbackSpeed: Float = 1f
+        var playbackSpeed: Float = 1f,
+        var nextUri: String = "",
+        var nextMetadata: String = "",
+        var generation: Long = 0L
     )
 
     private val state = MediaState()
+    private var playbackCompleted = false
+
+    enum class PlaybackStatus { BUFFERING, PLAYING, PAUSED, ENDED, IDLE }
+
+    /** The listener must enqueue notifications, never perform network I/O here. */
+    @Volatile var onStateChanged: ((MediaState) -> Unit)? = null
+
+    private fun changed() { onStateChanged?.invoke(state.copy()) }
 
     var onSetUri: ((String, String) -> Unit)? = null
     var onPlay: (() -> Unit)? = null
@@ -41,88 +52,147 @@ class DlnaMediaRenderer {
     var onVolumeChanged: ((Int) -> Unit)? = null
     var onMuteChanged: ((Boolean) -> Unit)? = null
 
-    fun setAVTransportURI(uri: String, metadata: String) {
-        state.uri = decodeXmlEntities(uri)
-        state.metadata = metadata
-        state.playlist = parsePlaylist(state.uri, metadata)
-        state.currentIndex = state.playlist.indexOf(state.uri).takeIf { it >= 0 } ?: 0
-        state.transportState = TransportState.STOPPED
-        Timber.i("DLNA SetAVTransportURI: ${state.uri}, playlist size=${state.playlist.size}")
-        onSetUri?.invoke(state.uri, metadata)
+    @Synchronized fun setAVTransportURI(uri: String, metadata: String) {
+        load(decodeXmlEntities(uri), decodeXmlEntities(metadata), TransportState.STOPPED)
     }
 
-    fun play() {
+    private fun load(uri: String, metadata: String, transportState: TransportState) {
+        state.uri = uri
+        state.metadata = metadata
+        state.playlist = parsePlaylist(state.uri, state.metadata)
+        state.currentIndex = state.playlist.indexOf(state.uri).takeIf { it >= 0 } ?: 0
+        state.nextUri = ""
+        state.nextMetadata = ""
+        state.position = 0L
+        state.duration = 0L
+        state.generation++
+        playbackCompleted = false
+        state.transportState = transportState
+        changed()
+        Timber.i("DLNA SetAVTransportURI: ${state.uri}, playlist size=${state.playlist.size}")
+        onSetUri?.invoke(state.uri, state.metadata)
+    }
+
+    /** A next URI is a buffer, not a quality change or an immediate load. */
+    @Synchronized fun setNextAVTransportURI(uri: String, metadata: String) {
+        state.nextUri = decodeXmlEntities(uri)
+        state.nextMetadata = if (state.nextUri.isBlank()) "" else decodeXmlEntities(metadata)
+        changed()
+    }
+
+    @Synchronized fun next(): Boolean {
+        if (state.nextUri.isBlank()) return false
+        val uri = state.nextUri
+        val metadata = state.nextMetadata
+        load(uri, metadata, TransportState.TRANSITIONING)
+        return true
+    }
+
+    @Synchronized fun play() {
         if (state.uri.isNotBlank()) {
+            playbackCompleted = false
             state.transportState = TransportState.PLAYING
+            changed()
             Timber.i("DLNA Play")
             onPlay?.invoke()
         }
     }
 
-    fun pause() {
+    @Synchronized fun pause() {
         state.transportState = TransportState.PAUSED_PLAYBACK
+        changed()
         Timber.i("DLNA Pause")
         onPause?.invoke()
     }
 
-    fun stop() {
+    @Synchronized fun stop() {
+        playbackCompleted = true
         state.transportState = TransportState.STOPPED
+        changed()
         Timber.i("DLNA Stop")
         onStop?.invoke()
     }
 
-    fun seek(target: String) {
+    @Synchronized fun seek(target: String) {
         val position = parseTimeToMs(target)
         state.position = position
         Timber.i("DLNA Seek: $target -> $position ms")
         onSeek?.invoke(position)
     }
 
-    fun setPlaybackSpeed(speed: String) {
+    @Synchronized fun setPlaybackSpeed(speed: String) {
         val value = speed.toFloatOrNull()?.coerceIn(0.25f, 4f) ?: 1f
         state.playbackSpeed = value
+        changed()
         Timber.i("DLNA SetSpeed: $value")
         onSpeedChanged?.invoke(value)
     }
 
-    fun setQualityUri(uri: String) {
+    @Synchronized fun setQualityUri(uri: String) {
         val decoded = decodeXmlEntities(uri)
         if (decoded.isNotBlank()) {
             state.uri = decoded
+            changed()
             Timber.i("DLNA SetQualityURI: $decoded")
             onQualityUriChanged?.invoke(decoded)
         }
     }
 
-    fun setVolume(volume: Int) {
+    @Synchronized fun setVolume(volume: Int) {
         state.volume = volume.coerceIn(0, 100)
+        changed()
         Timber.i("DLNA SetVolume: ${state.volume}")
         onVolumeChanged?.invoke(state.volume)
     }
 
-    fun setMute(muted: Boolean) {
+    @Synchronized fun setMute(muted: Boolean) {
         state.muted = muted
+        changed()
         Timber.i("DLNA SetMute: $muted")
         onMuteChanged?.invoke(muted)
     }
 
-    fun getState(): MediaState = state.copy()
+    @Synchronized fun getState(): MediaState = state.copy()
 
-    fun updatePosition(position: Long, duration: Long) {
-        state.position = position
-        state.duration = duration
+    /** Explicit player state keeps completion distinct from pause and buffering.
+     * A generation rejects delayed broadcasts from a replaced episode. */
+    @Synchronized fun updatePlayback(
+        generation: Long, position: Long, duration: Long, status: PlaybackStatus,
+        currentUri: String? = null
+    ) {
+        if (generation != state.generation || playbackCompleted) return
+        state.position = position.coerceAtLeast(0L)
+        state.duration = duration.coerceAtLeast(0L)
+        val index = state.playlist.indexOf(currentUri)
+        if (index >= 0) {
+            state.currentIndex = index
+            state.uri = state.playlist[index]
+        }
+        when (status) {
+            PlaybackStatus.ENDED -> {
+                playbackCompleted = true
+                if (next()) return
+                state.transportState = TransportState.STOPPED
+            }
+            PlaybackStatus.BUFFERING -> state.transportState = TransportState.TRANSITIONING
+            PlaybackStatus.PLAYING -> state.transportState = TransportState.PLAYING
+            PlaybackStatus.PAUSED -> state.transportState = TransportState.PAUSED_PLAYBACK
+            PlaybackStatus.IDLE -> state.transportState = TransportState.STOPPED
+        }
+        changed()
     }
 
-    fun setPlaying() {
-        state.transportState = TransportState.PLAYING
-    }
-
-    fun setStopped() {
+    @Synchronized fun playbackStopped(generation: Long) {
+        if (generation != state.generation) return
+        playbackCompleted = true
         state.transportState = TransportState.STOPPED
+        changed()
     }
 
-    fun setPaused() {
-        state.transportState = TransportState.PAUSED_PLAYBACK
+    @Synchronized fun setStopped() {
+        playbackCompleted = true
+        state.transportState = TransportState.STOPPED
+        changed()
     }
 
     private fun parseTimeToMs(time: String): Long {
@@ -144,11 +214,11 @@ class DlnaMediaRenderer {
 
     private fun decodeXmlEntities(value: String): String {
         return value
-            .replace("&amp;", "&")
             .replace("&lt;", "<")
             .replace("&gt;", ">")
             .replace("&quot;", "\"")
             .replace("&apos;", "'")
+            .replace("&amp;", "&")
     }
 
     private fun parsePlaylist(currentUri: String, metadata: String): List<String> {
@@ -182,36 +252,15 @@ object SoapParser {
     }
 
     fun extractTagValue(xml: String, tagName: String): String {
-        // 尝试多种模式匹配，提高兼容性
-        val patterns = listOf(
-            // 标准格式：<tagName>value</tagName>
-            Pattern.compile("<$tagName>(.*?)</$tagName>", Pattern.DOTALL or Pattern.CASE_INSENSITIVE),
-            // 命名空间格式：<prefix:tagName>value</prefix:tagName>
-            Pattern.compile("<[^:>]+:$tagName>(.*?)</[^:>]+:$tagName>", Pattern.DOTALL or Pattern.CASE_INSENSITIVE),
-            // CDATA 格式：<tagName><![CDATA[value]]></tagName>
-            Pattern.compile("<$tagName><!\\[CDATA\\[(.*?)\\]\\]></$tagName>", Pattern.DOTALL or Pattern.CASE_INSENSITIVE),
-            // 属性格式（有些客户端把值放在属性里）
-            Pattern.compile("<$tagName[^>]*>\\s*<!\\[CDATA\\[(.*?)\\]\\]>\\s*</$tagName>", Pattern.DOTALL or Pattern.CASE_INSENSITIVE)
-        )
-
-        for (pattern in patterns) {
-            val matcher = pattern.matcher(xml)
-            if (matcher.find()) {
-                val value = matcher.group(1)?.trim().orEmpty()
-                if (value.isNotEmpty()) {
-                    return value
-                }
-            }
-        }
-
-        // 如果都没匹配到，尝试直接搜索标签名（不区分大小写）
-        val fallbackPattern = Pattern.compile("<[^>]*${tagName}[^>]*>(.*?)</[^>]*>", Pattern.DOTALL or Pattern.CASE_INSENSITIVE)
-        val fallbackMatcher = fallbackPattern.matcher(xml)
-        if (fallbackMatcher.find()) {
-            return fallbackMatcher.group(1)?.trim().orEmpty()
-        }
-
-        return ""
+        // Match the exact local name: an empty NextURI must never match NextURIMetaData.
+        val name = "(?:[\\w.-]+:)?${Pattern.quote(tagName)}"
+        val pattern = Pattern.compile("<$name(?:\\s[^>]*)?>(.*?)</$name\\s*>",
+            Pattern.DOTALL or Pattern.CASE_INSENSITIVE)
+        val matcher = pattern.matcher(xml)
+        if (!matcher.find()) return ""
+        val value = matcher.group(1)?.trim().orEmpty()
+        return if (value.startsWith("<![CDATA[") && value.endsWith("]]>"))
+            value.removePrefix("<![CDATA[").removeSuffix("]]>") else value
     }
 
     fun escapeXml(value: String): String {

@@ -1,0 +1,2 @@
+af2ead152f2366d817265e0ab7ec55ddcd1cd4a7358491d84c6674bb0fd6759d  apks/original-v1.2.13/miracast-receiver-v1.2.13-armeabi-v7a.apk
+3fff8794141aa85ee9f71bc14abac0f32dda5d8af8746ad9f50481c475a361c2  apks/autonext-v1.2.13/miracast-receiver-v1.2.13-autonext.1-armeabi-v7a.apk
