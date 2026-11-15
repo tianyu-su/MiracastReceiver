@@ -1,3 +1,5 @@
+> **Android 5 / ARM32 安装备份**：本仓库保存了原版 v1.2.13 与已验证的连播修复版 v1.2.13-autonext.1 的源码和 APK。请先阅读 [安装与版本说明](INSTALL_ANDROID5.md)。
+
 # Miracast Receiver for Android TV
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
